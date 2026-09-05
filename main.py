@@ -17,7 +17,7 @@ def load_state(state):
         pyboy.load_state(f)
 
 def read_m(addr):
-    return pyboy.get_memory_value(addr)
+    return pyboy.memory[addr]
 
 def read_hp(start):
     input_byte = hex(start)

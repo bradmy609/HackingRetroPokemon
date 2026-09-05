@@ -1,4 +1,3 @@
-
 import sys
 import uuid 
 import os
@@ -11,22 +10,21 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 from skimage.transform import resize
 from pyboy import PyBoy
-from pyboy.logger import log_level
 import hnswlib
 import mediapy as media
 import pandas as pd
 
 from gymnasium import Env, spaces
 from pyboy.utils import WindowEvent
+import warnings
 
 class RedGymEnv(Env):
-
 
     def __init__(
         self, config=None):
 
-        self.debug = config['debug']
-        self.s_path = config['session_path']
+        # ensure session path is a Path
+        self.s_path = Path(config['session_path'])
         self.save_final_state = config['save_final_state']
         self.print_rewards = config['print_rewards']
         self.vec_dim = 4320 #1000
@@ -47,7 +45,7 @@ class RedGymEnv(Env):
         self.reward_scale = 1 if 'reward_scale' not in config else config['reward_scale']
         self.extra_buttons = False if 'extra_buttons' not in config else config['extra_buttons']
         self.instance_id = str(uuid.uuid4())[:8] if 'instance_id' not in config else config['instance_id']
-        self.s_path.mkdir(exist_ok=True)
+        self.s_path.mkdir(parents=True, exist_ok=True)
         self.reset_count = 0
         self.all_runs = []
 
@@ -98,28 +96,89 @@ class RedGymEnv(Env):
 
         head = 'headless' if config['headless'] else 'SDL2'
 
-        log_level("ERROR")
         self.pyboy = PyBoy(
                 config['gb_path'],
-                debugging=False,
-                disable_input=False,
-                window_type=head,
-                hide_window='--quiet' in sys.argv,
+                window=head,
             )
 
-        self.screen = self.pyboy.botsupport_manager().screen()
+        # Initialize and attach a screen wrapper so render() won't fail
+        self._init_screen()
 
         if not config['headless']:
-            self.pyboy.set_emulation_speed(6)
+            try:
+                self.pyboy.set_emulation_speed(6)
+            except Exception:
+                # some PyBoy versions may not support set_emulation_speed in this context
+                pass
             
         self.reset()
+
+    def _init_screen(self):
+        """
+        Try multiple ways to get a screen object or create a thin wrapper that
+        exposes screen_ndarray(). If none available, attach a dummy screen that
+        returns a blank frame to avoid AttributeError in render().
+        """
+        self.screen = None
+        try:
+            # Common pattern: pyboy.screen with screen.screen_ndarray()
+            if hasattr(self.pyboy, "screen") and getattr(self.pyboy, "screen") is not None:
+                self.screen = self.pyboy.screen
+                return
+            # Some versions expose a helper that returns ndarray directly
+            if hasattr(self.pyboy, "screen_ndarray"):
+                class _ScreenWrapper:
+                    def __init__(self, pyboy):
+                        self._pyboy = pyboy
+                    def screen_ndarray(self):
+                        return self._pyboy.screen_ndarray()
+                self.screen = _ScreenWrapper(self.pyboy)
+                return
+            if hasattr(self.pyboy, "get_screen_ndarray"):
+                class _ScreenWrapper2:
+                    def __init__(self, pyboy):
+                        self._pyboy = pyboy
+                    def screen_ndarray(self):
+                        return self._pyboy.get_screen_ndarray()
+                self.screen = _ScreenWrapper2(self.pyboy)
+                return
+            # botsupport_manager pattern (may be present for some builds)
+            if hasattr(self.pyboy, "botsupport_manager"):
+                try:
+                    mgr = self.pyboy.botsupport_manager()
+                    # mgr.screen() might be callable
+                    if mgr is not None:
+                        scr = None
+                        if hasattr(mgr, "screen"):
+                            try:
+                                scr = mgr.screen()
+                            except TypeError:
+                                scr = mgr.screen
+                        if scr is not None:
+                            self.screen = scr
+                            return
+                except Exception:
+                    pass
+        except Exception:
+            # If anything goes wrong, fall through to dummy
+            pass
+
+        warnings.warn("Unable to attach PyBoy screen object. Render will return blank frames.")
+        # Create dummy wrapper so self.screen.screen_ndarray() always exists
+        class _DummyScreen:
+            def screen_ndarray(self):
+                return np.zeros((144,160,3), dtype=np.uint8)
+        self.screen = _DummyScreen()
 
     def reset(self, seed=None):
         self.seed = seed
         # restart game, skipping credits
-        with open(self.init_state, "rb") as f:
-            self.pyboy.load_state(f)
-        
+        try:
+            with open(self.init_state, "rb") as f:
+                self.pyboy.load_state(f)
+        except Exception as e:
+            warnings.warn(f"Failed to load initial state: {e}")
+
         if self.use_screen_explore:
             self.init_knn()
         else:
@@ -136,7 +195,7 @@ class RedGymEnv(Env):
         
         if self.save_video:
             base_dir = self.s_path / Path('rollouts')
-            base_dir.mkdir(exist_ok=True)
+            base_dir.mkdir(parents=True, exist_ok=True)
             full_name = Path(f'full_reset_{self.reset_count}_id{self.instance_id}').with_suffix('.mp4')
             model_name = Path(f'model_reset_{self.reset_count}_id{self.instance_id}').with_suffix('.mp4')
             self.full_frame_writer = media.VideoWriter(base_dir / full_name, (144, 160), fps=60)
@@ -170,7 +229,13 @@ class RedGymEnv(Env):
         self.seen_coords = {}
 
     def render(self, reduce_res=True, add_memory=True, update_mem=True):
-        game_pixels_render = self.screen.screen_ndarray() # (144, 160, 3)
+        # Use screen wrapper to get raw pixels; ensure we always return an ndarray
+        try:
+            game_pixels_render = self.screen.screen_ndarray() # (144, 160, 3)
+        except Exception as e:
+            warnings.warn(f"Failed to get screen pixels from PyBoy: {e}")
+            game_pixels_render = np.zeros((144,160,3), dtype=np.uint8)
+
         if reduce_res:
             game_pixels_render = (255*resize(game_pixels_render, self.output_shape)).astype(np.uint8)
             if update_mem:
@@ -232,9 +297,11 @@ class RedGymEnv(Env):
     def run_action_on_emulator(self, action):
         # press button then release after some steps
         self.pyboy.send_input(self.valid_actions[action])
-        # disable rendering when we don't need it
         if not self.save_video and self.headless:
-            self.pyboy._rendering(False)
+            try:
+                self.pyboy._rendering(False)
+            except Exception:
+                pass
         for i in range(self.act_freq):
             # release action, so they are stateless
             if i == 8:
@@ -249,7 +316,10 @@ class RedGymEnv(Env):
             if self.save_video and not self.fast_video:
                 self.add_video_frame()
             if i == self.act_freq-1:
-                self.pyboy._rendering(True)
+                try:
+                    self.pyboy._rendering(True)
+                except Exception:
+                    pass
             self.pyboy.tick()
         if self.save_video and self.fast_video:
             self.add_video_frame()
@@ -408,7 +478,7 @@ class RedGymEnv(Env):
             print('', flush=True)
             if self.save_final_state:
                 fs_path = self.s_path / Path('final_states')
-                fs_path.mkdir(exist_ok=True)
+                fs_path.mkdir(parents=True, exist_ok=True)
                 plt.imsave(
                     fs_path / Path(f'frame_r{self.total_reward:.4f}_{self.reset_count}_small.jpeg'), 
                     obs_memory)
@@ -417,8 +487,11 @@ class RedGymEnv(Env):
                     self.render(reduce_res=False))
 
         if self.save_video and done:
-            self.full_frame_writer.close()
-            self.model_frame_writer.close()
+            try:
+                self.full_frame_writer.close()
+                self.model_frame_writer.close()
+            except Exception:
+                pass
 
         if done:
             self.all_runs.append(self.progress_reward)
@@ -428,7 +501,7 @@ class RedGymEnv(Env):
                 self.s_path / Path(f'agent_stats_{self.instance_id}.csv.gz'), compression='gzip', mode='a')
     
     def read_m(self, addr):
-        return self.pyboy.get_memory_value(addr)
+        return self.pyboy.memory[addr]
 
     def read_bit(self, addr, bit: int) -> bool:
         # add padding so zero will read '0b100000000' instead of '0b0'
@@ -539,7 +612,7 @@ class RedGymEnv(Env):
     
     def save_screenshot(self, name):
         ss_dir = self.s_path / Path('screenshots')
-        ss_dir.mkdir(exist_ok=True)
+        ss_dir.mkdir(parents=True, exist_ok=True)
         plt.imsave(
             ss_dir / Path(f'frame{self.instance_id}_r{self.total_reward:.4f}_{self.reset_count}_{name}.jpeg'), 
             self.render(reduce_res=False))
@@ -621,4 +694,22 @@ class RedGymEnv(Env):
             return map_locations[map_idx]
         else:
             return "Unknown Location"
-    
+
+    def close(self):
+        """
+        Cleanly stop PyBoy and close any video writers.
+        SubprocVecEnv / parent should call env.close() when shutting down.
+        """
+        try:
+            if hasattr(self, "pyboy") and self.pyboy is not None:
+                try:
+                    self.pyboy.stop()
+                except Exception:
+                    pass
+        finally:
+            if getattr(self, "save_video", False):
+                try:
+                    self.full_frame_writer.close()
+                    self.model_frame_writer.close()
+                except Exception:
+                    pass
